@@ -12,19 +12,19 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk
 import json
-import os
-import re
-import subprocess
 from pathlib import Path
 
 CONFIG_FILE = Path.home() / ".config" / "disk-io-monitor" / "config.json"
 
 DEFAULT_CONFIG = {
-    "read_color":  "#44ee77",
-    "write_color": "#ee3333",
-    "bar_width":   10,
-    "bar_height":  28,
-    "bar_gap":     3,
+    "read_color":       "#44ee77",
+    "write_color":      "#ee3333",
+    "bar_width":        10,
+    "bar_height":       28,
+    "bar_gap":          3,
+    "bg_opacity":       85,          # прозрачность фона (0-100%)
+    "show_read_pct":    True,        # показывать % чтения
+    "show_write_pct":   True,        # показывать % записи
 }
 
 
@@ -44,40 +44,6 @@ def load_config() -> dict:
 def save_config(cfg: dict):
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-
-
-# ──────────────────────────────────────────────────
-#  Автообновление genmon
-# ──────────────────────────────────────────────────
-def refresh_genmon():
-    """
-    Ищет genmon плагины которые используют наш скрипт
-    и принудительно обновляет их через xfce4-panel.
-    """
-    try:
-        out = subprocess.check_output(
-            ["xfconf-query", "-c", "xfce4-panel", "-l"],
-            stderr=subprocess.DEVNULL, text=True
-        )
-        # Ищем /plugins/plugin-N/command
-        ids = re.findall(r"/plugins/plugin-(\d+)/command", out)
-        for pid in ids:
-            try:
-                cmd = subprocess.check_output(
-                    ["xfconf-query", "-c", "xfce4-panel",
-                     "-p", f"/plugins/plugin-{pid}/command"],
-                    stderr=subprocess.DEVNULL, text=True
-                ).strip()
-                if "disk-io-monitor" in cmd:
-                    subprocess.run(
-                        ["xfce4-panel",
-                         f"--plugin-event=genmon-{pid}:refresh:bool:true"],
-                        stderr=subprocess.DEVNULL
-                    )
-            except Exception:
-                pass
-    except Exception:
-        pass
 
 
 # ──────────────────────────────────────────────────
@@ -101,6 +67,7 @@ class PreviewBar(Gtk.DrawingArea):
         bar_w = max(4,  int(cfg.get("bar_width",  10)))
         bar_h = max(10, int(cfg.get("bar_height", 28)))
         gap   = max(1,  int(cfg.get("bar_gap",    3)))
+        bg_op = max(0, min(100, int(cfg.get("bg_opacity", 85)))) / 100.0
 
         def _rgb(h):
             h = h.lstrip("#")
@@ -108,14 +75,14 @@ class PreviewBar(Gtk.DrawingArea):
 
         rc = _rgb(cfg.get("read_color",  "#44ee77"))
         wc = _rgb(cfg.get("write_color", "#ee3333"))
-        bg = (0.13, 0.13, 0.15)
+        bg = (0.25, 0.25, 0.28)   # серый фон (более светлый)
 
         rx = gap
         wx = gap + bar_w + gap
         by = 2
 
-        # Фон
-        cr.set_source_rgba(*bg, 0.85)
+        # Фон с настраиваемой прозрачностью - серый цвет
+        cr.set_source_rgba(*bg, bg_op)
         cr.rectangle(rx, by, bar_w, bar_h)
         cr.fill()
         cr.rectangle(wx, by, bar_w, bar_h)
@@ -247,6 +214,39 @@ class SettingsWindow(Gtk.Window):
 
         vbox.pack_start(frame_sz, False, False, 0)
 
+        # ── Прозрачность фона ────────────────────
+        frame_bg  = Gtk.Frame(label="  Прозрачность фона  ")
+        grid_bg   = Gtk.Grid(row_spacing=8, column_spacing=12)
+        grid_bg.set_border_width(10)
+        frame_bg.add(grid_bg)
+
+        grid_bg.attach(self._lbl("Прозрачность (%):"), 0, 0, 1, 1)
+        self.spin_bg_opacity = self._spin(
+            self.cfg.get("bg_opacity", 85), 0, 100, 5,
+            self._on_bg_opacity
+        )
+        grid_bg.attach(self.spin_bg_opacity, 1, 0, 1, 1)
+
+        vbox.pack_start(frame_bg, False, False, 0)
+
+        # ── Отображение % чтения/записи ───────────
+        frame_disp = Gtk.Frame(label="  Отображение  ")
+        grid_disp  = Gtk.Grid(row_spacing=8, column_spacing=12)
+        grid_disp.set_border_width(10)
+        frame_disp.add(grid_disp)
+
+        self.chk_read_pct = Gtk.CheckButton(label="Показывать % чтения")
+        self.chk_read_pct.set_active(self.cfg.get("show_read_pct", True))
+        self.chk_read_pct.connect("toggled", self._on_show_read_pct)
+        grid_disp.attach(self.chk_read_pct, 0, 0, 2, 1)
+
+        self.chk_write_pct = Gtk.CheckButton(label="Показывать % записи")
+        self.chk_write_pct.set_active(self.cfg.get("show_write_pct", True))
+        self.chk_write_pct.connect("toggled", self._on_show_write_pct)
+        grid_disp.attach(self.chk_write_pct, 0, 1, 2, 1)
+
+        vbox.pack_start(frame_disp, False, False, 0)
+
         # ── Подсказка ────────────────────────────
         note = Gtk.Label()
         note.set_markup(
@@ -305,7 +305,6 @@ class SettingsWindow(Gtk.Window):
     def _apply(self):
         save_config(self.cfg)
         self.preview.refresh()
-        refresh_genmon()
 
     def _on_read_color(self, btn):
         self.cfg["read_color"] = self._rgba_to_hex(btn.get_rgba())
@@ -327,6 +326,18 @@ class SettingsWindow(Gtk.Window):
         self.cfg["bar_gap"] = int(spin.get_value())
         self._apply()
 
+    def _on_bg_opacity(self, spin):
+        self.cfg["bg_opacity"] = int(spin.get_value())
+        self._apply()
+
+    def _on_show_read_pct(self, chk):
+        self.cfg["show_read_pct"] = chk.get_active()
+        self._apply()
+
+    def _on_show_write_pct(self, chk):
+        self.cfg["show_write_pct"] = chk.get_active()
+        self._apply()
+
     def _on_reset(self, _btn):
         self.cfg = DEFAULT_CONFIG.copy()
         save_config(self.cfg)
@@ -336,8 +347,10 @@ class SettingsWindow(Gtk.Window):
         self.spin_width.set_value(self.cfg["bar_width"])
         self.spin_height.set_value(self.cfg["bar_height"])
         self.spin_gap.set_value(self.cfg["bar_gap"])
+        self.spin_bg_opacity.set_value(self.cfg.get("bg_opacity", 85))
+        self.chk_read_pct.set_active(self.cfg.get("show_read_pct", True))
+        self.chk_write_pct.set_active(self.cfg.get("show_write_pct", True))
         self.preview.refresh()
-        refresh_genmon()
 
 
 # ──────────────────────────────────────────────────
