@@ -5,6 +5,9 @@ Disk I/O Monitor — xfce4-genmon-plugin
 Показывает вертикальные прогресс-бары (busy time %) для каждого диска.
 Левый бар = Read (чтение), правый = Write (запись).
 
+Формат: sda || sdb || sdc ||
+(имя диска, затем два вертикальных бара)
+
 Диски ищем через /dev/disk/by-id/ → symlink → /dev/sda
 Процент нагрузки = из /proc/diskstats (read_ms / write_ms)
 
@@ -12,8 +15,6 @@ Disk I/O Monitor — xfce4-genmon-plugin
 """
 
 import json
-import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -75,9 +76,9 @@ def get_physical_disks() -> dict:
         for link in sorted(disk_dir.iterdir()):
             lname = link.name
             # Пропускаем партиции: -part1, -part2, partN в by-path
-            if re.search(r"-part\d+$", lname):
+            if "-part" in lname and lname[-1].isdigit():
                 continue
-            if re.search(r"[_-]p\d+$", lname):
+            if "_p" in lname and lname[-1].isdigit():
                 continue
             try:
                 target = link.resolve()
@@ -113,11 +114,10 @@ def _disks_from_procfs() -> dict:
                     continue
                 if name.startswith(("zram", "dm-", "md", "ram", "sr")):
                     continue
-                if re.fullmatch(r"nvme\d+n\d+p\d+", name):
+                # Пропускаем партиции
+                if name[-1].isdigit() and not name.startswith("nvme"):
                     continue
-                if re.fullmatch(r"mmcblk\d+p\d+", name):
-                    continue
-                if re.fullmatch(r"[a-z]+\d+", name):
+                if name.startswith("nvme") and "p" in name and name[-1].isdigit():
                     continue
                 result[name] = f"/dev/{name}"
     except Exception:
@@ -130,10 +130,12 @@ def _disks_from_procfs() -> dict:
 # ──────────────────────────────────────────────────
 def read_diskstats() -> dict:
     """
-    Возвращает {dev: {read_ms, write_ms, io_ticks}}
-    read_ms  = суммарное время чтения (мс)
-    write_ms = суммарное время записи (мс)
-    io_ticks = суммарное время I/O    (мс)
+    Возвращает {dev: {read_ms, write_ms, io_ticks, read_sectors, write_sectors}}
+    read_ms       = суммарное время чтения (мс)
+    write_ms      = суммарное время записи (мс)
+    io_ticks      = суммарное время I/O    (мс)
+    read_sectors  = прочитано секторов (512 байт каждый)
+    write_sectors = записано секторов (512 байт каждый)
     """
     stats = {}
     try:
@@ -143,9 +145,11 @@ def read_diskstats() -> dict:
                 if len(p) < 14:
                     continue
                 stats[p[2]] = {
-                    "read_ms":  int(p[6]),
-                    "write_ms": int(p[10]),
-                    "io_ticks": int(p[12]),
+                    "read_ms":       int(p[6]),
+                    "write_ms":      int(p[10]),
+                    "io_ticks":      int(p[12]),
+                    "read_sectors":  int(p[3]),
+                    "write_sectors": int(p[7]),
                 }
     except Exception:
         pass
@@ -210,7 +214,7 @@ def render_png(disks_data: list, cfg: dict, out_path: Path):
 
     rc  = hex_to_rgb(cfg.get("read_color",  "#44ee77"))
     wc  = hex_to_rgb(cfg.get("write_color", "#ee3333"))
-    bg  = (0.13, 0.13, 0.15)   # фон пустого бара
+    bg  = (0.25, 0.25, 0.28)   # серый фон пустого бара (более светлый)
     lc  = (0.70, 0.70, 0.75)   # цвет подписи
 
     for i, (name, read_pct, write_pct) in enumerate(disks_data):
@@ -221,7 +225,8 @@ def render_png(disks_data: list, cfg: dict, out_path: Path):
         by = pad_v                  # y верха баров
 
         # ── Фон баров с настраиваемой прозрачностью ──────────────────────────
-        cr.set_source_rgba(*bg, bg_op)
+        # Рисуем серый фон всегда видимым
+        cr.set_source_rgba(0.25, 0.25, 0.28, bg_op)
         cr.rectangle(rx, by, bar_w, bar_h)
         cr.fill()
         cr.rectangle(wx, by, bar_w, bar_h)
@@ -261,12 +266,17 @@ def render_png(disks_data: list, cfg: dict, out_path: Path):
 #  Форматирование скорости (для tooltip)
 # ──────────────────────────────────────────────────
 def fmt_speed(bps: float) -> str:
+    """Форматирует скорость в человекочитаемый вид: TB/s, GB/s, MB/s, KB/s."""
+    if bps >= 1 << 40:
+        return f"{bps / (1 << 40):.1f} TB/s"
     if bps >= 1 << 30:
         return f"{bps / (1 << 30):.1f} GB/s"
     if bps >= 1 << 20:
         return f"{bps / (1 << 20):.1f} MB/s"
     if bps >= 1 << 10:
         return f"{bps / (1 << 10):.0f} KB/s"
+    if bps > 0:
+        return f"{bps:.0f} B/s"
     return "0 B/s"
 
 
@@ -284,6 +294,7 @@ def main():
     prev_stats  = state.get("stats", {})
 
     elapsed_ms  = max(1.0, (now - prev_time) * 1000.0)
+    elapsed_sec = max(0.001, now - prev_time)
 
     disks_data  = []
     tool_lines  = ["💾 Disk I/O Monitor", ""]
@@ -292,20 +303,26 @@ def main():
         curr = curr_stats.get(name, {})
         prev = prev_stats.get(name, curr)
 
-        d_read_ms  = max(0, curr.get("read_ms",  0) - prev.get("read_ms",  0))
-        d_write_ms = max(0, curr.get("write_ms", 0) - prev.get("write_ms", 0))
-        d_io_ticks = max(0, curr.get("io_ticks", 0) - prev.get("io_ticks", 0))
+        d_read_ms      = max(0, curr.get("read_ms",  0) - prev.get("read_ms",  0))
+        d_write_ms     = max(0, curr.get("write_ms", 0) - prev.get("write_ms", 0))
+        d_io_ticks     = max(0, curr.get("io_ticks", 0) - prev.get("io_ticks", 0))
+        d_read_sect    = max(0, curr.get("read_sectors",  0) - prev.get("read_sectors",  0))
+        d_write_sect   = max(0, curr.get("write_sectors", 0) - prev.get("write_sectors", 0))
 
         read_pct   = min(100.0, d_read_ms  / elapsed_ms * 100.0)
         write_pct  = min(100.0, d_write_ms / elapsed_ms * 100.0)
         busy_pct   = min(100.0, d_io_ticks / elapsed_ms * 100.0)
 
+        # Скорость в байтах/сек (сектор = 512 байт)
+        read_speed_bps  = d_read_sect  * 512 / elapsed_sec
+        write_speed_bps = d_write_sect * 512 / elapsed_sec
+
         disks_data.append((name, read_pct, write_pct))
 
         tool_lines.append(f"  📀  {name}   ({disks[name]})")
-        tool_lines.append(f"       ▲ Read busy:   {read_pct:.1f}%")
-        tool_lines.append(f"       ▼ Write busy:  {write_pct:.1f}%")
-        tool_lines.append(f"       ⏱ Total busy:  {busy_pct:.1f}%")
+        tool_lines.append(f"       ▲ Read:   {read_pct:.1f}%   │   {fmt_speed(read_speed_bps)}")
+        tool_lines.append(f"       ▼ Write:  {write_pct:.1f}%   │   {fmt_speed(write_speed_bps)}")
+        tool_lines.append(f"       ⏱ Total:  {busy_pct:.1f}%")
         tool_lines.append("")
 
     tool_lines.append("⚙  Нажми для настроек")
@@ -334,7 +351,6 @@ def main():
 
     # Клик → открывает настройки
     print(f"<txtclick>disk-io-monitor-settings</txtclick>")
-    print(f"<txt> ⚙</txt>")
     print(f"<tool>{tool}</tool>")
 
 

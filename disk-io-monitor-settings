@@ -75,13 +75,13 @@ class PreviewBar(Gtk.DrawingArea):
 
         rc = _rgb(cfg.get("read_color",  "#44ee77"))
         wc = _rgb(cfg.get("write_color", "#ee3333"))
-        bg = (0.13, 0.13, 0.15)
+        bg = (0.25, 0.25, 0.28)   # серый фон (более светлый)
 
         rx = gap
         wx = gap + bar_w + gap
         by = 2
 
-        # Фон с настраиваемой прозрачностью
+        # Фон с настраиваемой прозрачностью - серый цвет
         cr.set_source_rgba(*bg, bg_op)
         cr.rectangle(rx, by, bar_w, bar_h)
         cr.fill()
