@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""
+Disk I/O Monitor — xfce4-genmon-plugin
+=======================================
+Показывает вертикальные прогресс-бары (busy time %) для каждого диска.
+Левый бар = Read (чтение), правый = Write (запись).
+
+Диски ищем через /dev/disk/by-id/ → symlink → /dev/sda
+Процент нагрузки = из /proc/diskstats (read_ms / write_ms)
+
+Клик по ⚙ → открывает окно настроек.
+"""
+
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+try:
+    import cairo
+    HAS_CAIRO = True
+except ImportError:
+    HAS_CAIRO = False
+
+# ──────────────────────────────────────────────────
+#  Пути
+# ──────────────────────────────────────────────────
+CONFIG_FILE = Path.home() / ".config" / "disk-io-monitor" / "config.json"
+STATE_FILE  = Path("/tmp/disk_io_monitor_state.json")
+IMG_FILE    = Path("/tmp/disk_io_monitor_bars.png")
+
+DEFAULT_CONFIG = {
+    "read_color":  "#44ee77",   # зелёный
+    "write_color": "#ee3333",   # красный
+    "bar_width":   10,          # толщина одного бара (px)
+    "bar_height":  28,          # высота баров (px)
+    "bar_gap":     3,           # зазор между барами (px)
+}
+
+
+# ──────────────────────────────────────────────────
+#  Конфиг
+# ──────────────────────────────────────────────────
+def load_config() -> dict:
+    try:
+        saved = json.loads(CONFIG_FILE.read_text())
+        cfg = DEFAULT_CONFIG.copy()
+        cfg.update(saved)
+        return cfg
+    except Exception:
+        return DEFAULT_CONFIG.copy()
+
+
+# ──────────────────────────────────────────────────
+#  Поиск дисков через /dev/disk/
+# ──────────────────────────────────────────────────
+def get_physical_disks() -> dict:
+    """
+    Перебирает /dev/disk/by-id/ (потом by-path/ как запасной).
+    Симлинки без суффикса -partN → физический диск.
+    Возвращает {dev_name: dev_path}, напр. {'sda': '/dev/sda'}
+    """
+    result = {}
+
+    for subdir in ("by-id", "by-path"):
+        disk_dir = Path(f"/dev/disk/{subdir}")
+        if not disk_dir.exists():
+            continue
+
+        for link in sorted(disk_dir.iterdir()):
+            lname = link.name
+            # Пропускаем партиции: -part1, -part2, partN в by-path
+            if re.search(r"-part\d+$", lname):
+                continue
+            if re.search(r"[_-]p\d+$", lname):
+                continue
+            try:
+                target = link.resolve()
+                if not target.exists():
+                    continue
+                dev_name = target.name          # 'sda', 'nvme0n1' …
+                if dev_name not in result:
+                    result[dev_name] = str(target)
+            except Exception:
+                continue
+
+        if result:
+            break   # нашли в первом доступном subdir
+
+    # Запасной вариант — /proc/diskstats
+    if not result:
+        result = _disks_from_procfs()
+
+    return result
+
+
+def _disks_from_procfs() -> dict:
+    """Фильтрует /proc/diskstats — только физические диски."""
+    result = {}
+    try:
+        with open("/proc/diskstats") as f:
+            for line in f:
+                p = line.split()
+                if len(p) < 14:
+                    continue
+                name = p[2]
+                if name.startswith("loop"):
+                    continue
+                if name.startswith(("zram", "dm-", "md", "ram", "sr")):
+                    continue
+                if re.fullmatch(r"nvme\d+n\d+p\d+", name):
+                    continue
+                if re.fullmatch(r"mmcblk\d+p\d+", name):
+                    continue
+                if re.fullmatch(r"[a-z]+\d+", name):
+                    continue
+                result[name] = f"/dev/{name}"
+    except Exception:
+        pass
+    return result
+
+
+# ──────────────────────────────────────────────────
+#  Чтение /proc/diskstats
+# ──────────────────────────────────────────────────
+def read_diskstats() -> dict:
+    """
+    Возвращает {dev: {read_ms, write_ms, io_ticks}}
+    read_ms  = суммарное время чтения (мс)
+    write_ms = суммарное время записи (мс)
+    io_ticks = суммарное время I/O    (мс)
+    """
+    stats = {}
+    try:
+        with open("/proc/diskstats") as f:
+            for line in f:
+                p = line.split()
+                if len(p) < 14:
+                    continue
+                stats[p[2]] = {
+                    "read_ms":  int(p[6]),
+                    "write_ms": int(p[10]),
+                    "io_ticks": int(p[12]),
+                }
+    except Exception:
+        pass
+    return stats
+
+
+# ──────────────────────────────────────────────────
+#  Состояние между запусками
+# ──────────────────────────────────────────────────
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_state(data: dict):
+    try:
+        STATE_FILE.write_text(json.dumps(data))
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────────
+#  Рендер PNG с прогресс-барами
+# ──────────────────────────────────────────────────
+def hex_to_rgb(h: str) -> tuple:
+    h = h.lstrip("#")
+    return tuple(int(h[i: i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def render_png(disks_data: list, cfg: dict, out_path: Path):
+    """
+    disks_data : [(name, read_pct, write_pct), ...]
+    Рисует два вертикальных бара на диск, заливка снизу.
+    """
+    bar_w   = max(4,  int(cfg.get("bar_width",  10)))
+    bar_h   = max(10, int(cfg.get("bar_height", 28)))
+    gap     = max(1,  int(cfg.get("bar_gap",    3)))
+    label_h = 11
+    pad_v   = 2   # вертикальный отступ сверху и снизу
+
+    # ширина одного диска: [gap][R-bar][gap][W-bar][gap]
+    disk_w  = gap + bar_w + gap + bar_w + gap
+
+    n       = max(1, len(disks_data))
+    img_w   = n * disk_w
+    img_h   = pad_v + bar_h + pad_v + label_h
+
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, img_w, img_h)
+    cr      = cairo.Context(surface)
+
+    # Прозрачный фон
+    cr.set_operator(cairo.OPERATOR_CLEAR)
+    cr.paint()
+    cr.set_operator(cairo.OPERATOR_OVER)
+
+    rc  = hex_to_rgb(cfg.get("read_color",  "#44ee77"))
+    wc  = hex_to_rgb(cfg.get("write_color", "#ee3333"))
+    bg  = (0.13, 0.13, 0.15)   # фон пустого бара
+    lc  = (0.70, 0.70, 0.75)   # цвет подписи
+
+    for i, (name, read_pct, write_pct) in enumerate(disks_data):
+        ox = i * disk_w   # x-смещение диска
+
+        rx = ox + gap               # x левого (read) бара
+        wx = ox + gap + bar_w + gap # x правого (write) бара
+        by = pad_v                  # y верха баров
+
+        # ── Фон баров ──────────────────────────
+        cr.set_source_rgba(*bg, 0.85)
+        cr.rectangle(rx, by, bar_w, bar_h)
+        cr.fill()
+        cr.rectangle(wx, by, bar_w, bar_h)
+        cr.fill()
+
+        # ── Read бар (снизу вверх) ──────────────
+        r_h = bar_h * min(100.0, max(0.0, read_pct)) / 100.0
+        if r_h >= 1:
+            cr.set_source_rgba(*rc, 0.90)
+            cr.rectangle(rx, by + bar_h - r_h, bar_w, r_h)
+            cr.fill()
+
+        # ── Write бар (снизу вверх) ────────────
+        w_h = bar_h * min(100.0, max(0.0, write_pct)) / 100.0
+        if w_h >= 1:
+            cr.set_source_rgba(*wc, 0.90)
+            cr.rectangle(wx, by + bar_h - w_h, bar_w, w_h)
+            cr.fill()
+
+        # ── Подпись диска ─────────────────────
+        cr.set_source_rgb(*lc)
+        cr.select_font_face("Monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(8)
+        label = name[:5]
+        te    = cr.text_extents(label)
+        lx    = ox + disk_w / 2 - te.width / 2 - te.x_bearing
+        ly    = pad_v + bar_h + pad_v + label_h - 2
+        cr.move_to(lx, ly)
+        cr.show_text(label)
+
+    surface.write_to_png(str(out_path))
+
+
+# ──────────────────────────────────────────────────
+#  Форматирование скорости (для tooltip)
+# ──────────────────────────────────────────────────
+def fmt_speed(bps: float) -> str:
+    if bps >= 1 << 30:
+        return f"{bps / (1 << 30):.1f} GB/s"
+    if bps >= 1 << 20:
+        return f"{bps / (1 << 20):.1f} MB/s"
+    if bps >= 1 << 10:
+        return f"{bps / (1 << 10):.0f} KB/s"
+    return "0 B/s"
+
+
+# ──────────────────────────────────────────────────
+#  Главная функция
+# ──────────────────────────────────────────────────
+def main():
+    cfg         = load_config()
+    now         = time.time()
+    disks       = get_physical_disks()
+    curr_stats  = read_diskstats()
+
+    state       = load_state()
+    prev_time   = state.get("time", now)
+    prev_stats  = state.get("stats", {})
+
+    elapsed_ms  = max(1.0, (now - prev_time) * 1000.0)
+
+    disks_data  = []
+    tool_lines  = ["💾 Disk I/O Monitor", ""]
+
+    for name in sorted(disks.keys()):
+        curr = curr_stats.get(name, {})
+        prev = prev_stats.get(name, curr)
+
+        d_read_ms  = max(0, curr.get("read_ms",  0) - prev.get("read_ms",  0))
+        d_write_ms = max(0, curr.get("write_ms", 0) - prev.get("write_ms", 0))
+        d_io_ticks = max(0, curr.get("io_ticks", 0) - prev.get("io_ticks", 0))
+
+        read_pct   = min(100.0, d_read_ms  / elapsed_ms * 100.0)
+        write_pct  = min(100.0, d_write_ms / elapsed_ms * 100.0)
+        busy_pct   = min(100.0, d_io_ticks / elapsed_ms * 100.0)
+
+        disks_data.append((name, read_pct, write_pct))
+
+        tool_lines.append(f"  📀  {name}   ({disks[name]})")
+        tool_lines.append(f"       ▲ Read busy:   {read_pct:.1f}%")
+        tool_lines.append(f"       ▼ Write busy:  {write_pct:.1f}%")
+        tool_lines.append(f"       ⏱ Total busy:  {busy_pct:.1f}%")
+        tool_lines.append("")
+
+    tool_lines.append("⚙  Нажми для настроек")
+
+    # Сохраняем состояние
+    save_state({
+        "time":  now,
+        "stats": {k: curr_stats[k] for k in disks if k in curr_stats},
+    })
+
+    tool = "\n".join(tool_lines).rstrip()
+
+    if not disks_data:
+        disks_data = [("?", 0, 0)]
+
+    if HAS_CAIRO:
+        try:
+            render_png(disks_data, cfg, IMG_FILE)
+            print(f"<img>{IMG_FILE}</img>")
+        except Exception as e:
+            print(f"<txt>ERR: {e}</txt>")
+    else:
+        # Текстовый fallback если нет cairo
+        lines = [f"{n} R:{r:.0f}% W:{w:.0f}%" for n, r, w in disks_data]
+        print(f"<txt>{'  '.join(lines)}</txt>")
+
+    # Клик → открывает настройки
+    print(f"<txtclick>disk-io-monitor-settings</txtclick>")
+    print(f"<txt> ⚙</txt>")
+    print(f"<tool>{tool}</tool>")
+
+
+if __name__ == "__main__":
+    main()

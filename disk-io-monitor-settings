@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""
+Disk I/O Monitor — Настройки
+==============================
+Standalone GTK3 окно (НЕ встроено в панель).
+Все настройки применяются сразу — кнопки «Сохранить» нет.
+
+Открывается кликом на ⚙ в панели или командой: disk-io-monitor-settings
+"""
+
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk
+import json
+import os
+import re
+import subprocess
+from pathlib import Path
+
+CONFIG_FILE = Path.home() / ".config" / "disk-io-monitor" / "config.json"
+
+DEFAULT_CONFIG = {
+    "read_color":  "#44ee77",
+    "write_color": "#ee3333",
+    "bar_width":   10,
+    "bar_height":  28,
+    "bar_gap":     3,
+}
+
+
+# ──────────────────────────────────────────────────
+#  Конфиг
+# ──────────────────────────────────────────────────
+def load_config() -> dict:
+    try:
+        saved = json.loads(CONFIG_FILE.read_text())
+        cfg = DEFAULT_CONFIG.copy()
+        cfg.update(saved)
+        return cfg
+    except Exception:
+        return DEFAULT_CONFIG.copy()
+
+
+def save_config(cfg: dict):
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+
+# ──────────────────────────────────────────────────
+#  Автообновление genmon
+# ──────────────────────────────────────────────────
+def refresh_genmon():
+    """
+    Ищет genmon плагины которые используют наш скрипт
+    и принудительно обновляет их через xfce4-panel.
+    """
+    try:
+        out = subprocess.check_output(
+            ["xfconf-query", "-c", "xfce4-panel", "-l"],
+            stderr=subprocess.DEVNULL, text=True
+        )
+        # Ищем /plugins/plugin-N/command
+        ids = re.findall(r"/plugins/plugin-(\d+)/command", out)
+        for pid in ids:
+            try:
+                cmd = subprocess.check_output(
+                    ["xfconf-query", "-c", "xfce4-panel",
+                     "-p", f"/plugins/plugin-{pid}/command"],
+                    stderr=subprocess.DEVNULL, text=True
+                ).strip()
+                if "disk-io-monitor" in cmd:
+                    subprocess.run(
+                        ["xfce4-panel",
+                         f"--plugin-event=genmon-{pid}:refresh:bool:true"],
+                        stderr=subprocess.DEVNULL
+                    )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────────
+#  Превью баров (мини-виджет)
+# ──────────────────────────────────────────────────
+class PreviewBar(Gtk.DrawingArea):
+    """Показывает два вертикальных бара с текущими настройками."""
+
+    def __init__(self, cfg_getter):
+        super().__init__()
+        self._get_cfg = cfg_getter
+        self.set_size_request(80, 50)
+        self.connect("draw", self._draw)
+
+    def refresh(self):
+        self.queue_draw()
+
+    def _draw(self, widget, cr):
+        import cairo as _cairo
+        cfg   = self._get_cfg()
+        bar_w = max(4,  int(cfg.get("bar_width",  10)))
+        bar_h = max(10, int(cfg.get("bar_height", 28)))
+        gap   = max(1,  int(cfg.get("bar_gap",    3)))
+
+        def _rgb(h):
+            h = h.lstrip("#")
+            return tuple(int(h[i:i+2], 16)/255 for i in (0, 2, 4))
+
+        rc = _rgb(cfg.get("read_color",  "#44ee77"))
+        wc = _rgb(cfg.get("write_color", "#ee3333"))
+        bg = (0.13, 0.13, 0.15)
+
+        rx = gap
+        wx = gap + bar_w + gap
+        by = 2
+
+        # Фон
+        cr.set_source_rgba(*bg, 0.85)
+        cr.rectangle(rx, by, bar_w, bar_h)
+        cr.fill()
+        cr.rectangle(wx, by, bar_w, bar_h)
+        cr.fill()
+
+        # Read 60%
+        rh = bar_h * 0.6
+        cr.set_source_rgba(*rc, 0.9)
+        cr.rectangle(rx, by + bar_h - rh, bar_w, rh)
+        cr.fill()
+
+        # Write 30%
+        wh = bar_h * 0.3
+        cr.set_source_rgba(*wc, 0.9)
+        cr.rectangle(wx, by + bar_h - wh, bar_w, wh)
+        cr.fill()
+
+        # Подпись
+        cr.set_source_rgb(0.7, 0.7, 0.75)
+        cr.select_font_face("Monospace", _cairo.FONT_SLANT_NORMAL, _cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(8)
+        cr.move_to(rx, by + bar_h + 10)
+        cr.show_text("sda")
+        return False
+
+
+# ──────────────────────────────────────────────────
+#  Главное окно настроек
+# ──────────────────────────────────────────────────
+class SettingsWindow(Gtk.Window):
+
+    def __init__(self):
+        super().__init__(title="Disk I/O Monitor — Настройки")
+        self.set_resizable(False)
+        self.set_border_width(14)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.connect("destroy", Gtk.main_quit)
+
+        self.cfg = load_config()
+        self._build_ui()
+
+    # ── Построение UI ───────────────────────────
+    def _build_ui(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.add(vbox)
+
+        # Заголовок
+        title = Gtk.Label()
+        title.set_markup("<big><b>💾 Disk I/O Monitor</b></big>")
+        title.set_halign(Gtk.Align.START)
+        vbox.pack_start(title, False, False, 0)
+
+        vbox.pack_start(Gtk.Separator(), False, False, 0)
+
+        # ── Превью ──────────────────────────────
+        frame_prev = Gtk.Frame(label="  Превью  ")
+        hbox_prev  = Gtk.Box(spacing=12)
+        hbox_prev.set_border_width(10)
+        self.preview = PreviewBar(lambda: self.cfg)
+        hbox_prev.pack_start(self.preview, False, False, 0)
+
+        lbl_prev = Gtk.Label()
+        lbl_prev.set_markup(
+            "<small>"
+            "Левый бар  = <span color='#44ee77'>● Read</span>\n"
+            "Правый бар = <span color='#ee3333'>● Write</span>\n\n"
+            "Заливка снизу вверх\n"
+            "= % занятости (busy time)"
+            "</small>"
+        )
+        lbl_prev.set_halign(Gtk.Align.START)
+        hbox_prev.pack_start(lbl_prev, False, False, 0)
+        frame_prev.add(hbox_prev)
+        vbox.pack_start(frame_prev, False, False, 0)
+
+        # ── Цвета ───────────────────────────────
+        frame_col = Gtk.Frame(label="  Цвета  ")
+        grid_col  = Gtk.Grid(row_spacing=8, column_spacing=12)
+        grid_col.set_border_width(10)
+        frame_col.add(grid_col)
+
+        # Read
+        grid_col.attach(self._lbl("Цвет Read (чтение):"), 0, 0, 1, 1)
+        self.btn_read = Gtk.ColorButton()
+        self.btn_read.set_use_alpha(False)
+        self._set_color_btn(self.btn_read, self.cfg["read_color"])
+        self.btn_read.connect("color-set", self._on_read_color)
+        grid_col.attach(self.btn_read, 1, 0, 1, 1)
+
+        # Write
+        grid_col.attach(self._lbl("Цвет Write (запись):"), 0, 1, 1, 1)
+        self.btn_write = Gtk.ColorButton()
+        self.btn_write.set_use_alpha(False)
+        self._set_color_btn(self.btn_write, self.cfg["write_color"])
+        self.btn_write.connect("color-set", self._on_write_color)
+        grid_col.attach(self.btn_write, 1, 1, 1, 1)
+
+        vbox.pack_start(frame_col, False, False, 0)
+
+        # ── Размеры ─────────────────────────────
+        frame_sz  = Gtk.Frame(label="  Размеры баров  ")
+        grid_sz   = Gtk.Grid(row_spacing=8, column_spacing=12)
+        grid_sz.set_border_width(10)
+        frame_sz.add(grid_sz)
+
+        # Bar width (толщина)
+        grid_sz.attach(self._lbl("Толщина (px):"), 0, 0, 1, 1)
+        self.spin_width = self._spin(
+            self.cfg["bar_width"], 4, 50, 1,
+            self._on_bar_width
+        )
+        grid_sz.attach(self.spin_width, 1, 0, 1, 1)
+
+        # Bar height
+        grid_sz.attach(self._lbl("Высота (px):"), 0, 1, 1, 1)
+        self.spin_height = self._spin(
+            self.cfg["bar_height"], 10, 120, 1,
+            self._on_bar_height
+        )
+        grid_sz.attach(self.spin_height, 1, 1, 1, 1)
+
+        # Bar gap
+        grid_sz.attach(self._lbl("Зазор (px):"), 0, 2, 1, 1)
+        self.spin_gap = self._spin(
+            self.cfg["bar_gap"], 1, 20, 1,
+            self._on_bar_gap
+        )
+        grid_sz.attach(self.spin_gap, 1, 2, 1, 1)
+
+        vbox.pack_start(frame_sz, False, False, 0)
+
+        # ── Подсказка ────────────────────────────
+        note = Gtk.Label()
+        note.set_markup(
+            "<small><i>⚙  Скорость обновления настраивается в свойствах\n"
+            "     Generic Monitor → Period (рекомендуется 1 сек)</i></small>"
+        )
+        note.set_halign(Gtk.Align.START)
+        vbox.pack_start(note, False, False, 0)
+
+        vbox.pack_start(Gtk.Separator(), False, False, 0)
+
+        # ── Кнопки ──────────────────────────────
+        hbox_btn = Gtk.Box(spacing=8)
+        btn_reset = Gtk.Button(label="↺ По умолчанию")
+        btn_reset.connect("clicked", self._on_reset)
+        hbox_btn.pack_start(btn_reset, True, True, 0)
+
+        btn_close = Gtk.Button(label="✕ Закрыть")
+        btn_close.connect("clicked", lambda _: Gtk.main_quit())
+        hbox_btn.pack_start(btn_close, True, True, 0)
+
+        vbox.pack_start(hbox_btn, False, False, 0)
+
+        self.show_all()
+
+    # ── Хелперы UI ──────────────────────────────
+    @staticmethod
+    def _lbl(text):
+        lbl = Gtk.Label(label=text)
+        lbl.set_halign(Gtk.Align.END)
+        return lbl
+
+    @staticmethod
+    def _spin(val, lo, hi, step, cb):
+        adj  = Gtk.Adjustment(value=val, lower=lo, upper=hi,
+                              step_increment=step)
+        spin = Gtk.SpinButton(adjustment=adj, numeric=True)
+        spin.connect("value-changed", cb)
+        return spin
+
+    @staticmethod
+    def _set_color_btn(btn, hex_color):
+        rgba = Gdk.RGBA()
+        rgba.parse(hex_color)
+        btn.set_rgba(rgba)
+
+    @staticmethod
+    def _rgba_to_hex(rgba) -> str:
+        return "#{:02x}{:02x}{:02x}".format(
+            int(rgba.red   * 255),
+            int(rgba.green * 255),
+            int(rgba.blue  * 255),
+        )
+
+    # ── Обработчики — каждый сразу сохраняет ────
+    def _apply(self):
+        save_config(self.cfg)
+        self.preview.refresh()
+        refresh_genmon()
+
+    def _on_read_color(self, btn):
+        self.cfg["read_color"] = self._rgba_to_hex(btn.get_rgba())
+        self._apply()
+
+    def _on_write_color(self, btn):
+        self.cfg["write_color"] = self._rgba_to_hex(btn.get_rgba())
+        self._apply()
+
+    def _on_bar_width(self, spin):
+        self.cfg["bar_width"] = int(spin.get_value())
+        self._apply()
+
+    def _on_bar_height(self, spin):
+        self.cfg["bar_height"] = int(spin.get_value())
+        self._apply()
+
+    def _on_bar_gap(self, spin):
+        self.cfg["bar_gap"] = int(spin.get_value())
+        self._apply()
+
+    def _on_reset(self, _btn):
+        self.cfg = DEFAULT_CONFIG.copy()
+        save_config(self.cfg)
+        # Обновляем виджеты
+        self._set_color_btn(self.btn_read,  self.cfg["read_color"])
+        self._set_color_btn(self.btn_write, self.cfg["write_color"])
+        self.spin_width.set_value(self.cfg["bar_width"])
+        self.spin_height.set_value(self.cfg["bar_height"])
+        self.spin_gap.set_value(self.cfg["bar_gap"])
+        self.preview.refresh()
+        refresh_genmon()
+
+
+# ──────────────────────────────────────────────────
+def main():
+    win = SettingsWindow()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
