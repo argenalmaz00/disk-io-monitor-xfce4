@@ -32,11 +32,14 @@ STATE_FILE  = Path("/tmp/disk_io_monitor_state.json")
 IMG_FILE    = Path("/tmp/disk_io_monitor_bars.png")
 
 DEFAULT_CONFIG = {
-    "read_color":  "#44ee77",   # зелёный
-    "write_color": "#ee3333",   # красный
-    "bar_width":   10,          # толщина одного бара (px)
-    "bar_height":  28,          # высота баров (px)
-    "bar_gap":     3,           # зазор между барами (px)
+    "read_color":       "#44ee77",   # зелёный
+    "write_color":      "#ee3333",   # красный
+    "bar_width":        10,          # толщина одного бара (px)
+    "bar_height":       28,          # высота баров (px)
+    "bar_gap":          3,           # зазор между барами (px)
+    "bg_opacity":       85,          # прозрачность фона (0-100%)
+    "show_read_pct":    True,        # показывать % чтения
+    "show_write_pct":   True,        # показывать % записи
 }
 
 
@@ -178,12 +181,17 @@ def render_png(disks_data: list, cfg: dict, out_path: Path):
     """
     disks_data : [(name, read_pct, write_pct), ...]
     Рисует два вертикальных бара на диск, заливка снизу.
+    Формат: имя "sd*" затем прогресс бар (read || write)
+    Пример: sda || sdb || sdc ||
     """
     bar_w   = max(4,  int(cfg.get("bar_width",  10)))
     bar_h   = max(10, int(cfg.get("bar_height", 28)))
     gap     = max(1,  int(cfg.get("bar_gap",    3)))
     label_h = 11
     pad_v   = 2   # вертикальный отступ сверху и снизу
+    bg_op   = max(0, min(100, int(cfg.get("bg_opacity", 85)))) / 100.0
+    show_read  = cfg.get("show_read_pct", True)
+    show_write = cfg.get("show_write_pct", True)
 
     # ширина одного диска: [gap][R-bar][gap][W-bar][gap]
     disk_w  = gap + bar_w + gap + bar_w + gap
@@ -212,26 +220,28 @@ def render_png(disks_data: list, cfg: dict, out_path: Path):
         wx = ox + gap + bar_w + gap # x правого (write) бара
         by = pad_v                  # y верха баров
 
-        # ── Фон баров ──────────────────────────
-        cr.set_source_rgba(*bg, 0.85)
+        # ── Фон баров с настраиваемой прозрачностью ──────────────────────────
+        cr.set_source_rgba(*bg, bg_op)
         cr.rectangle(rx, by, bar_w, bar_h)
         cr.fill()
         cr.rectangle(wx, by, bar_w, bar_h)
         cr.fill()
 
         # ── Read бар (снизу вверх) ──────────────
-        r_h = bar_h * min(100.0, max(0.0, read_pct)) / 100.0
-        if r_h >= 1:
-            cr.set_source_rgba(*rc, 0.90)
-            cr.rectangle(rx, by + bar_h - r_h, bar_w, r_h)
-            cr.fill()
+        if show_read:
+            r_h = bar_h * min(100.0, max(0.0, read_pct)) / 100.0
+            if r_h >= 1:
+                cr.set_source_rgba(*rc, 0.90)
+                cr.rectangle(rx, by + bar_h - r_h, bar_w, r_h)
+                cr.fill()
 
         # ── Write бар (снизу вверх) ────────────
-        w_h = bar_h * min(100.0, max(0.0, write_pct)) / 100.0
-        if w_h >= 1:
-            cr.set_source_rgba(*wc, 0.90)
-            cr.rectangle(wx, by + bar_h - w_h, bar_w, w_h)
-            cr.fill()
+        if show_write:
+            w_h = bar_h * min(100.0, max(0.0, write_pct)) / 100.0
+            if w_h >= 1:
+                cr.set_source_rgba(*wc, 0.90)
+                cr.rectangle(wx, by + bar_h - w_h, bar_w, w_h)
+                cr.fill()
 
         # ── Подпись диска ─────────────────────
         cr.set_source_rgb(*lc)
